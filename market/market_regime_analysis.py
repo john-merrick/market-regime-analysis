@@ -14,6 +14,7 @@ UPDATED:
 - Ensures the SAME colour mapping is used consistently across the entire PDF report
 """
 
+import argparse
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -70,25 +71,25 @@ class RegimeAnalyzer:
     # -----------------------------
     # Polygon fetchers
     # -----------------------------
-    def fetch_sp500_data(self, start_date: str, end_date: str) -> pd.DataFrame:
-        """Fetch S&P 500 price data from Polygon (SPY proxy)"""
-        url = f"https://api.polygon.io/v2/aggs/ticker/SPY/range/1/day/{start_date}/{end_date}"
+    def fetch_price_data(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """Fetch daily OHLCV price data from Polygon for any ticker."""
+        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
         params = {'adjusted': 'true', 'sort': 'asc', 'limit': 50000, 'apiKey': self.polygon_key}
 
         response = requests.get(url, params=params)
         if response.status_code != 200:
-            raise Exception(f"Polygon API error (SPY): {response.status_code} {response.text}")
+            raise Exception(f"Polygon API error ({ticker}): {response.status_code} {response.text}")
 
         data = response.json()
         if 'results' not in data:
-            raise Exception("No SPY data returned from Polygon")
+            raise Exception(f"No data returned from Polygon for {ticker}")
 
         df = pd.DataFrame(data['results'])
         df['date'] = pd.to_datetime(df['t'], unit='ms').dt.normalize()
         df = df.rename(columns={'c': 'close', 'h': 'high', 'l': 'low', 'o': 'open', 'v': 'volume'})
         df = df.set_index('date')[['open', 'high', 'low', 'close', 'volume']]
 
-        print(f"S&P 500 (SPY) data: {len(df)} rows from {df.index.min()} to {df.index.max()}")
+        print(f"{ticker} data: {len(df)} rows from {df.index.min()} to {df.index.max()}")
         return df
 
     def fetch_vix_data(self, start_date: str, end_date: str) -> pd.Series:
@@ -220,6 +221,12 @@ class RegimeAnalyzer:
         features['term_spread'] = yields['30Y'] - yields['3M']
         return features
 
+    def build_realized_vol(self, price_df: pd.DataFrame, window: int = 21) -> pd.Series:
+        """21-day rolling realised volatility (annualised) from log returns."""
+        log_ret = np.log(price_df['close'] / price_df['close'].shift(1))
+        rv = log_ret.rolling(window).std() * np.sqrt(252)
+        return rv.rename('realized_vol')
+
     def prepare_regime_features(
         self,
         sp500: pd.DataFrame,
@@ -232,6 +239,7 @@ class RegimeAnalyzer:
 
         sp500['returns'] = np.log(sp500['close'] / sp500['close'].shift(1))
         sp500['momentum'] = sp500['close'].pct_change(60)
+        sp500['realized_vol'] = self.build_realized_vol(sp500)
 
         vix_vol = self.build_volatility_from_vix(vix)
 
@@ -247,7 +255,7 @@ class RegimeAnalyzer:
         yc_features.index = pd.to_datetime(yc_features.index).normalize()
         liq_features.index = pd.to_datetime(liq_features.index).normalize()
 
-        sp500_daily = sp500[['returns', 'momentum']].copy()
+        sp500_daily = sp500[['returns', 'momentum', 'realized_vol']].copy()
         vix_daily = vix_vol.to_frame().resample('D').ffill()
         yc_daily = yc_features.resample('D').ffill()
         liq_daily = liq_features.resample('D').ffill()
@@ -257,6 +265,15 @@ class RegimeAnalyzer:
         features = features.join(liq_daily, how='left')
 
         features = features.ffill().dropna()
+
+        # Composite distress score (MinMax-normalised components)
+        from sklearn.preprocessing import MinMaxScaler
+        _s = MinMaxScaler()
+        vol_n = _s.fit_transform(features[['volatility']]).flatten()
+        ret_n = _s.fit_transform(-features[['returns']]).flatten()
+        liq_n = _s.fit_transform(-features[['liquidity_change']]).flatten()
+        mom_n = _s.fit_transform(-features[['momentum']]).flatten()
+        features['distress_score'] = 0.35 * vol_n + 0.30 * ret_n + 0.20 * liq_n + 0.15 * mom_n
 
         print(f"Features shape after preparation: {features.shape}")
         if features.empty or len(features) < 100:
@@ -282,14 +299,20 @@ class RegimeAnalyzer:
 
         vol = regime_stats.loc['volatility'].copy()
         mom = regime_stats.loc['momentum'].copy()
+        ret = regime_stats.loc['returns'].copy()
         slope = regime_stats.loc['slope'].copy()
         liq = regime_stats.loc['liquidity_change'].copy()
 
         labels: Dict[int, str] = {}
         remaining = set(regime_stats.columns.tolist())
 
-        # Crisis: high vol + negative momentum
-        crisis_score = vol.rank(pct=True) + (-mom).rank(pct=True)
+        # Crisis: weighted composite — catches both VIX spikes and catastrophic drawdowns
+        crisis_score = (
+            2.0 * vol.rank(pct=True)
+            + 2.0 * (-mom).rank(pct=True)
+            + 1.5 * (-ret).rank(pct=True)
+            + 1.0 * (-liq).rank(pct=True)
+        )
         crisis_cluster = crisis_score.loc[list(remaining)].idxmax()
         labels[crisis_cluster] = 'Crisis'
         remaining.remove(crisis_cluster)
@@ -340,15 +363,45 @@ class RegimeAnalyzer:
                 labels[next_best] = other
                 remaining.remove(next_best)
 
-        # Recovery: whatever remains
-        if len(remaining) == 1:
-            rec = next(iter(remaining))
-            labels[rec] = 'Recovery'
-            remaining.remove(rec)
-        elif len(remaining) > 1:
-            for c in sorted(list(remaining), key=lambda x: mom.loc[x], reverse=True):
-                labels[c] = 'Recovery'
-            remaining.clear()
+        # Recovery: scored assignment — refuse to label a deeply distressed cluster as Recovery.
+        # When rem_list has >1 element use the rank threshold; for a single remaining cluster
+        # compare directly against the current Crisis cluster's distress.
+        if len(remaining) >= 1:
+            rem_list = list(remaining)
+            if len(rem_list) > 1:
+                recovery_score = (
+                    mom.loc[rem_list].rank(pct=True)
+                    + (-vol.loc[rem_list]).rank(pct=True)
+                    + liq.loc[rem_list].rank(pct=True)
+                )
+            else:
+                # Single element — rank collapses to 1.0; use 0.0 so distress comparison fires
+                recovery_score = pd.Series({rem_list[0]: 0.0})
+
+            for c in rem_list:
+                ann_ret = ret.loc[c] * 252 * 100
+                if ann_ret < -20.0 and recovery_score.get(c, 0.5) < 0.4:
+                    crisis_c = [k for k, v in labels.items() if v == 'Crisis']
+                    if crisis_c:
+                        crisis_c = crisis_c[0]
+                        # Annualise returns so they are on the same scale as vol/liq
+                        distress_new = (-ret.loc[c] * 252) + vol.loc[c] + (-liq.loc[c])
+                        distress_old = (-ret.loc[crisis_c] * 252) + vol.loc[crisis_c] + (-liq.loc[crisis_c])
+                        if distress_new > distress_old:
+                            labels[c] = 'Crisis'
+                            labels[crisis_c] = 'Recovery'
+                            print(f"[SANITY] Swapped cluster {c} -> Crisis, {crisis_c} -> Recovery")
+                        else:
+                            # Original Crisis is more distressed by VIX; still force c to Crisis
+                            # and demote crisis_c to avoid duplicate 'Crisis' columns
+                            labels[c] = 'Crisis'
+                            labels[crisis_c] = 'Recovery'
+                            print(f"[SANITY] Forced cluster {c} -> Crisis (return-driven), {crisis_c} -> Recovery")
+                    else:
+                        labels[c] = 'Crisis'
+                else:
+                    labels[c] = 'Recovery'
+                remaining.discard(c)
 
         return labels
 
@@ -366,18 +419,23 @@ class RegimeAnalyzer:
         label_map = self.label_regimes_six(regime_stats)
         regimes = cluster_series.map(label_map).rename('regime')
 
+        # Rename columns from cluster integers to regime names, then reorder canonically
+        regime_stats = regime_stats.rename(columns=label_map)
+        ordered_cols = [r for r in self.REGIME_ORDER if r in regime_stats.columns]
+        regime_stats = regime_stats[ordered_cols]
+
         return regimes, regime_stats
 
     # -----------------------------
     # End-to-end
     # -----------------------------
-    def run_analysis(self, start_date: str, end_date: str, n_regimes: int = 6) -> Dict[str, object]:
-        """Run complete regime analysis"""
+    def run_analysis(self, start_date: str, end_date: str, n_regimes: int = 6, ticker: str = 'SPY') -> Dict[str, object]:
+        """Run complete regime analysis for the given ticker."""
         if n_regimes != 6:
             print("[WARN] For exactly six regimes, set n_regimes=6.")
 
-        print("Fetching S&P 500 data from Polygon...")
-        sp500 = self.fetch_sp500_data(start_date, end_date)
+        print(f"Fetching {ticker} price data from Polygon...")
+        sp500 = self.fetch_price_data(ticker, start_date, end_date)
 
         print("Fetching VIX data from Polygon...")
         vix = self.fetch_vix_data(start_date, end_date)
@@ -395,6 +453,7 @@ class RegimeAnalyzer:
         regimes, regime_stats = self.detect_regimes(features, n_regimes=n_regimes)
 
         self.data = {
+            'ticker': ticker,
             'sp500': sp500,
             'vix': vix,
             'yields': yields,
@@ -448,13 +507,45 @@ class RegimeAnalyzer:
             print("Missing:", sorted(list(expected - present)))
             print("Extra:", sorted(list(present - expected)))
 
+        curr = regimes.iloc[-1]
+        if curr in regime_stats.columns:
+            ann_ret = regime_stats.loc['returns', curr] * 252 * 100
+            liq_chg = regime_stats.loc['liquidity_change', curr] * 100
+            print(f"\nCurrent regime cluster stats: Ann.Return={ann_ret:.1f}%, Liq.Change={liq_chg:.1f}%")
+
+        self.validate_transition_matrix()
+
+    def validate_transition_matrix(self):
+        """Warn if any regime has implausible self-persistence (likely mislabelling)."""
+        regimes = self.data['regimes']
+        labels = self.REGIME_ORDER
+        mat = np.zeros((6, 6))
+        for i in range(len(regimes) - 1):
+            cur, nxt = regimes.iloc[i], regimes.iloc[i + 1]
+            if cur in labels and nxt in labels:
+                mat[labels.index(cur), labels.index(nxt)] += 1
+        row_sums = mat.sum(axis=1, keepdims=True)
+        probs = np.divide(mat, row_sums, where=row_sums != 0, out=np.zeros_like(mat))
+        for i, r in enumerate(labels):
+            if probs[i, i] >= 0.99:
+                print(f"[WARN] '{r}' has {probs[i,i]*100:.1f}% self-persistence — likely mislabelled cluster.")
+            if row_sums[i] > 0 and probs[i, i] == 0.0:
+                print(f"[WARN] '{r}' never persists day-to-day — check cluster stability.")
+
     # -----------------------------
     # PDF reporting
     # -----------------------------
-    def generate_regime_report(self, output_path: str = 'regime_analysis_report.pdf'):
+    def generate_regime_report(self, output_path: str = None):
         if not self.data:
             print("No analysis data available. Run analysis first.")
             return
+
+        if output_path is None:
+            ticker = self.data.get('ticker', 'unknown')
+            regimes = self.data['regimes']
+            start = regimes.index[0].strftime('%Y-%m-%d')
+            end = regimes.index[-1].strftime('%Y-%m-%d')
+            output_path = f"regime_analysis_{ticker}_{start}_to_{end}.pdf"
 
         with PdfPages(output_path) as pdf:
             self._create_summary_page(pdf)
@@ -472,8 +563,9 @@ class RegimeAnalyzer:
         return [self.REGIME_COLORS.get(r, 'gray') for r in regimes_in_order]
 
     def _create_summary_page(self, pdf):
+        ticker = self.data.get('ticker', 'SPY')
         fig = plt.figure(figsize=(11, 8.5))
-        fig.suptitle('Market Regime Analysis Report', fontsize=20, fontweight='bold', y=0.98)
+        fig.suptitle(f'Market Regime Analysis Report — {ticker}', fontsize=20, fontweight='bold', y=0.98)
 
         plt.text(0.5, 0.92, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
                  ha='center', fontsize=10)
@@ -518,6 +610,9 @@ class RegimeAnalyzer:
         # Regime characteristics table (cluster means)
         ax2 = fig.add_subplot(2, 2, 2)
         stats_display = regime_stats.T[['returns', 'volatility', 'slope', 'liquidity_change']].copy()
+        # Reorder rows by canonical regime order
+        ordered_rows = [r for r in self.REGIME_ORDER if r in stats_display.index]
+        stats_display = stats_display.loc[ordered_rows]
         stats_display.columns = ['Return', 'VIX Vol', 'Yield Slope', 'Liquidity Δ']
         stats_display['Return'] = (stats_display['Return'] * 252 * 100).round(2)
         stats_display['VIX Vol'] = (stats_display['VIX Vol'] * 100).round(2)
@@ -572,8 +667,9 @@ class RegimeAnalyzer:
 
         sp500 = self.data['sp500']
         regimes = self.data['regimes']
+        ticker = self.data.get('ticker', 'SPY')
 
-        ax1.plot(sp500.index, sp500['close'], color='black', linewidth=1.5, label='S&P 500 (SPY)')
+        ax1.plot(sp500.index, sp500['close'], color='black', linewidth=1.5, label=ticker)
 
         for r in self.REGIME_ORDER:
             mask = regimes == r
@@ -586,7 +682,7 @@ class RegimeAnalyzer:
                     ax1.axvspan(d, d + timedelta(days=1), alpha=0.25, color=color)
 
         ax1.set_ylabel('Price ($)', fontsize=12, fontweight='bold')
-        ax1.set_title('S&P 500 Price with Regime Overlay', fontsize=14, fontweight='bold')
+        ax1.set_title(f'{ticker} Price with Regime Overlay', fontsize=14, fontweight='bold')
         ax1.grid(True, alpha=0.3)
         ax1.legend(loc='upper left')
 
@@ -767,23 +863,21 @@ class RegimeAnalyzer:
         plt.close()
 
     def _create_regime_heatmap(self, pdf):
-        """
-        Heatmap is by CLUSTER (not label), but we keep a consistent colourbar.
-        If you want heatmap rows ordered by regime label, that requires mapping cluster->label order;
-        you can do that later if you want.
-        """
         fig, ax = plt.subplots(figsize=(11, 8.5))
 
         regime_stats = self.data['regime_stats'].T
+        # Reorder rows by canonical regime order
+        ordered_rows = [r for r in self.REGIME_ORDER if r in regime_stats.index]
+        regime_stats = regime_stats.loc[ordered_rows]
         stats_normalized = (regime_stats - regime_stats.mean()) / regime_stats.std()
 
         sns.heatmap(stats_normalized, annot=True, fmt='.2f', cmap='RdYlGn',
                     center=0, cbar_kws={'label': 'Z-Score'}, ax=ax,
                     linewidths=0.5, linecolor='black')
 
-        ax.set_title('Cluster Characteristics Heatmap (Normalized)', fontsize=14, fontweight='bold', pad=20)
+        ax.set_title('Regime Characteristics Heatmap (Normalized)', fontsize=14, fontweight='bold', pad=20)
         ax.set_xlabel('Features', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Cluster', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Regime', fontsize=12, fontweight='bold')
 
         plt.tight_layout()
         pdf.savefig(fig, bbox_inches='tight')
@@ -823,10 +917,18 @@ class RegimeAnalyzer:
         plt.close()
 
 
-# Example usage
 if __name__ == "__main__":
     POLYGON_KEY = "116xopGPdlPmt4vYkX9BWphPgXtO8wy9"
     FRED_KEY = "f1bebd5081a74baa210b913b10c2c8cb"
+
+    parser = argparse.ArgumentParser(description='Market Regime Analysis')
+    parser.add_argument('ticker', nargs='?', default='SPY',
+                        help='Ticker symbol to analyse (default: SPY)')
+    parser.add_argument('--years', type=int, default=3,
+                        help='Years of history to fetch (default: 3)')
+    args = parser.parse_args()
+
+    ticker = args.ticker.upper()
 
     analyzer = RegimeAnalyzer(
         polygon_api_key=POLYGON_KEY,
@@ -834,20 +936,20 @@ if __name__ == "__main__":
     )
 
     end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=365 * 3)).strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=365 * args.years)).strftime('%Y-%m-%d')
 
-    # IMPORTANT: set n_regimes=6 to ensure 6 clusters and 6 labels
     results = analyzer.run_analysis(
         start_date=start_date,
         end_date=end_date,
-        n_regimes=6
+        n_regimes=6,
+        ticker=ticker
     )
 
     analyzer.print_regime_summary()
-    analyzer.generate_regime_report('regime_analysis_report.pdf')
+    analyzer.generate_regime_report()
 
     print(f"\nCurrent market regime: {analyzer.get_current_regime()}")
-    print(f"\nLatest S&P 500 close (SPY): ${results['sp500']['close'].iloc[-1]:.2f}")
+    print(f"\nLatest {ticker} close: ${results['sp500']['close'].iloc[-1]:.2f}")
     print(f"Latest VIX level: {results['vix'].iloc[-1]:.2f}")
     print(f"Current VIX-implied vol: {results['features']['volatility'].iloc[-1]:.2%}")
     print(f"10Y-2Y spread: {results['features']['slope'].iloc[-1]:.2f}%")
